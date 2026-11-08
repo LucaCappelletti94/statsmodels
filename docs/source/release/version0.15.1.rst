@@ -215,6 +215,12 @@ New functions and methods
   1000 observations, about 300 times faster for 60 variables, and returns a
   ``Series`` for a ``DataFrame``. :issue:`1669`, :pr:`2380`, :pr:`7711`,
   :pr:`10623`
+- ``MixedLMResults.t_test`` accepts ``df_method="satterthwaite"`` for t-tests
+  of the fixed effects with Satterthwaite degrees of freedom, as in the R
+  package lmerTest. The standard errors are those of the generalized least
+  squares estimate at the REML estimates of the variance parameters. This
+  corrects p-values that are too small for models with few groups.
+  :issue:`2620`
 
 Performance
 -----------

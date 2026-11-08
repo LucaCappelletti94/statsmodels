@@ -75,6 +75,13 @@ The statsmodels LME framework currently supports post-estimation
 inference via Wald tests and confidence intervals on the coefficients,
 profile likelihood analysis, likelihood ratio testing, and AIC.
 
+By default, the tests of the fixed effects use the normal distribution.
+With few groups, in particular for effects that are estimated between
+groups, this gives p-values that are too small. After a REML fit,
+``t_test`` with ``df_method="satterthwaite"`` uses the t distribution with
+Satterthwaite degrees of freedom for each hypothesis, as the R package
+lmerTest does.
+
 Examples
 --------
 
@@ -88,6 +95,12 @@ Examples
   md = smf.mixedlm("Weight ~ Time", data, groups=data["Pig"])
   mdf = md.fit()
   print(mdf.summary())
+
+  import numpy as np
+
+  tt = mdf.t_test(np.eye(2), df_method="satterthwaite")
+  print(tt.summary())
+  print(tt.df_denom)
 
 Detailed examples can be found here
 

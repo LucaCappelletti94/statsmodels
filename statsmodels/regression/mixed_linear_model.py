@@ -162,6 +162,7 @@ from statsmodels.base._penalties import Penalty
 import statsmodels.base.model as base
 from statsmodels.formula._manager import FormulaManager
 from statsmodels.formula.formulatools import advance_eval_env
+from statsmodels.stats.contrast import ContrastResults
 from statsmodels.tools import data as data_tools
 from statsmodels.tools._decorators import cache_readonly
 from statsmodels.tools.rng_qrng import check_random_state
@@ -647,6 +648,140 @@ def _convert_vc(exog_vc):
     vc_mats = [vc_mats[i] for i in ii]
 
     return VCSpec(vc_names, vc_colnames, vc_mats)
+
+
+def _psd_cholesky(mat):
+    """
+    Lower triangular factor of a positive semidefinite matrix
+
+    Parameters
+    ----------
+    mat : ndarray
+        A symmetric positive semidefinite matrix.
+
+    Returns
+    -------
+    ndarray
+        A lower triangular matrix ``L`` with a nonnegative diagonal and
+        ``L L' = mat``. A column whose pivot is zero is zero.
+    """
+    k = mat.shape[0]
+    lam = np.zeros_like(mat)
+    for j in range(k):
+        lam[j, j] = np.sqrt(max(mat[j, j] - lam[j, :j] @ lam[j, :j], 0.0))
+        num = mat[j + 1 :, j] - lam[j + 1 :, :j] @ lam[j, :j]
+        np.divide(num, lam[j, j], out=lam[j + 1 :, j], where=lam[j, j] > 0)
+    return lam
+
+
+def _theta_sigma_hessian(cov_re, vcomp, scale, deriv, df_resid):
+    """
+    Hessian of the REML deviance in the lme4 variance parameters
+
+    The variance parameters ``tau`` are the lower triangle of `cov_re`
+    (row-wise) and the variance components. In lme4, the parameters are the
+    relative Cholesky factor ``theta`` of the random effects covariance, the
+    relative standard deviations of the variance components and the error
+    standard deviation ``sigma``, with ``cov_re = sigma**2 L(theta) L(theta)'``.
+
+    Parameters
+    ----------
+    cov_re : ndarray
+        The covariance matrix of the random effects.
+    vcomp : ndarray
+        The variances of the variance components.
+    scale : float
+        The error variance.
+    deriv : tuple of ndarray
+        The gradient and the Hessian of the REML deviance with respect to
+        ``tau``, ``y' P G_k P y`` for each element of ``tau`` and ``y' P y``,
+        as returned by ``MixedLM._reml_variance_derivatives``.
+    df_resid : int
+        The number of observations minus the number of fixed effects.
+
+    Returns
+    -------
+    jac : ndarray
+        The Jacobian of ``tau`` with respect to ``theta``.
+    hess_vp : ndarray
+        The Hessian of the REML deviance with respect to ``(theta, sigma)``.
+
+    Notes
+    -----
+    Each element of ``tau`` is ``sigma**2 theta' M theta / 2`` for a constant
+    matrix ``M``. The Hessian in ``theta`` is ``jac' hess jac`` plus the
+    gradient times the second derivatives of ``tau``. The second term
+    vanishes at an interior optimum, but not on the boundary of the parameter
+    space. The derivative of ``V`` with respect to ``sigma`` is
+    ``2 V / sigma``, so the terms with ``sigma`` reduce to ``y' P G_k P y``,
+    ``y' P y`` and ``tr(P V) = df_resid``.
+    """
+    grad, hess, ypgpy, ypy = deriv
+    k_re = cov_re.shape[0]
+    ix = np.tril_indices(k_re)
+    k_re2 = len(ix[0])
+    sigma = np.sqrt(scale)
+    lam = _psd_cholesky(cov_re / scale)
+    theta = np.concatenate((lam[ix], np.sqrt(vcomp / scale)))
+    n_theta = len(theta)
+
+    # The constant matrices M, one for each element of tau
+    pos = {pair: m for m, pair in enumerate(zip(*ix, strict=True))}
+    mmats = np.zeros((n_theta, n_theta, n_theta))
+    for i_tau, (i, j) in enumerate(zip(*ix, strict=True)):
+        for m in range(j + 1):
+            a, b = pos[(i, m)], pos[(j, m)]
+            mmats[i_tau, a, b] += 1
+            mmats[i_tau, b, a] += 1
+    for j in range(k_re2, n_theta):
+        mmats[j, j, j] = 2
+
+    jac = scale * (mmats @ theta)
+    hess_vp = np.empty((n_theta + 1, n_theta + 1))
+    hess_vp[:n_theta, :n_theta] = jac.T @ hess @ jac
+    hess_vp[:n_theta, :n_theta] += scale * np.einsum("i,iab->ab", grad, mmats)
+    cross = 2 / sigma * (ypgpy @ jac)
+    hess_vp[:n_theta, n_theta] = cross
+    hess_vp[n_theta, :n_theta] = cross
+    hess_vp[n_theta, n_theta] = (6 * ypy - 2 * df_resid) / scale
+    return jac, hess_vp
+
+
+def _pinv_lmertest(hess, tol=1e-8):
+    """
+    Moore-Penrose inverse of a Hessian, dropping eigenvalues as lmerTest does
+
+    Parameters
+    ----------
+    hess : ndarray
+        A symmetric matrix.
+    tol : float, optional
+        Eigenvalues not above `tol` are dropped.
+
+    Returns
+    -------
+    ndarray
+        The inverse of `hess` on the span of the eigenvectors with
+        eigenvalues above `tol`.
+
+    Warns
+    -----
+    ConvergenceWarning
+        If an eigenvalue is below ``-tol`` or between ``-tol`` and `tol`.
+    """
+    evals, evecs = np.linalg.eigh(hess)
+    close = "Model may not have converged with {} {} close to zero: {}"
+    for drop, msg in (
+        (evals < -tol, "Model failed to converge with {} negative {}: {}"),
+        (np.abs(evals) < tol, close),
+    ):
+        n = int(drop.sum())
+        if n > 0:
+            noun = "eigenvalues" if n > 1 else "eigenvalue"
+            vals = " ".join(f"{v:1.1e}" for v in np.sort(evals[drop])[::-1])
+            warnings.warn(msg.format(n, noun, vals), ConvergenceWarning, stacklevel=5)
+    pos = evals > tol
+    return (evecs[:, pos] / evals[pos]) @ evecs[:, pos].T
 
 
 class MixedLM(base.LikelihoodModel):
@@ -2336,6 +2471,133 @@ class MixedLM(base.LikelihoodModel):
 
         return hess, sing
 
+    def _reml_variance_derivatives(self, cov_re, vcomp, scale):
+        """
+        Derivatives of the REML deviance with respect to the variance parameters
+
+        The variance parameters ``tau`` are the lower triangle of `cov_re`
+        (row-wise) and the variance components, on the scale of the data.
+        The marginal covariance matrix of a group is
+        ``V = scale I + sum_k tau_k G_k``.
+
+        Parameters
+        ----------
+        cov_re : ndarray
+            The covariance matrix of the random effects.
+        vcomp : ndarray
+            The variances of the variance components.
+        scale : float
+            The error variance.
+
+        Returns
+        -------
+        cov_fe : ndarray
+            ``(X' V^{-1} X)^{-1}``, the covariance matrix of the GLS estimate
+            of the fixed effects for known variance parameters.
+        xvgvx : ndarray
+            ``X' V^{-1} G_k V^{-1} X`` for each element of ``tau``, stacked
+            along the first axis.
+        grad : ndarray
+            The gradient of the REML deviance with respect to ``tau``.
+        hess : ndarray
+            The Hessian of the REML deviance with respect to ``tau``.
+        ypgpy : ndarray
+            ``y' P G_k P y`` for each element of ``tau``.
+        ypy : float
+            ``y' P y``.
+
+        Notes
+        -----
+        The REML deviance is ``log|V| + log|X' V^{-1} X| + y' P y`` with
+        ``P = V^{-1} - V^{-1} X cov_fe X' V^{-1}``. Its gradient is
+        ``tr(P G_k) - y' P G_k P y`` and its Hessian is
+        ``2 y' P G_k P G_l P y - tr(P G_k P G_l)``. The traces are
+        accumulated over the groups through ``X' V^{-1} G_k V^{-1} X`` and
+        ``X' V^{-1} G_k V^{-1} G_l V^{-1} X``, as in Kenward and Roger
+        (1997), so no matrix larger than the design matrices of a group is
+        formed.
+        """
+        k_fe = self.k_fe
+        n_tau = self.k_re2 + self.k_vc
+        cov_re_rel = cov_re / scale
+        vcomp_rel = vcomp / scale
+        re_good = self._re_degenerate(cov_re_rel)
+        cov_re_inv = np.empty((0, 0))
+        if self.k_re > 0 and re_good is None:
+            cov_re_inv = np.linalg.inv(cov_re_rel)
+        fe_params, _ = self.get_fe_params(cov_re_rel, vcomp_rel)
+
+        def gmul(factors, mat, vinv=False):
+            # G_k mat, or V^{-1} G_k mat if vinv, with G_k = sum of a b'
+            return sum(
+                _dot(va if vinv else a, _dot(b.T, mat)) for a, b, va, _ in factors
+            )
+
+        xvx = np.zeros((k_fe, k_fe))
+        ypy = 0.0
+        xvgvx = np.zeros((n_tau, k_fe, k_fe))
+        xvgvgvx = np.zeros((n_tau, n_tau, k_fe, k_fe))
+        xvgr = np.zeros((n_tau, k_fe))
+        ypgpy = np.zeros(n_tau)
+        rgvgr = np.zeros((n_tau, n_tau))
+        tr_vg = np.zeros(n_tau)
+        tr_vgvg = np.zeros((n_tau, n_tau))
+
+        for group_ix in range(self.n_groups):
+            vc_var = self._expand_vcomp(vcomp_rel, group_ix)
+            solver_rel, _ = self._group_solver(group_ix, cov_re_inv, re_good, vc_var)
+
+            def solver(rhs, solver_rel=solver_rel):
+                return solver_rel(rhs) / scale
+
+            exog = self.exog_li[group_ix]
+            resid = self.endog_li[group_ix] - exog @ fe_params
+            exog_vi = solver(exog)
+            resid_vi = solver(resid)
+            xvx += exog.T @ exog_vi
+            ypy += resid @ resid_vi
+
+            # G_k = sum of a b' over the tuples (a, b, V^{-1} a, V^{-1} b)
+            factors = []
+            for jj, matl, matr, vsl, vsr, sym in self._gen_dV_dPar(
+                self._aex_r[group_ix], solver, group_ix
+            ):
+                fac = [(matl, matr, vsl, vsr)]
+                if not sym:
+                    fac.append((matr, matl, vsr, vsl))
+                factors.append(fac)
+                tr_vg[jj] += sum(_dotsum(b, va) for _, b, va, _ in fac)
+
+            gvx = [gmul(fac, exog_vi) for fac in factors]
+            gr = [gmul(fac, resid_vi) for fac in factors]
+            for k2, fac2 in enumerate(factors):
+                xvgvx[k2] += exog_vi.T @ gvx[k2]
+                xvgr[k2] += exog_vi.T @ gr[k2]
+                ypgpy[k2] += resid_vi @ gr[k2]
+                vgvx = gmul(fac2, exog_vi, vinv=True)
+                vgr = gmul(fac2, resid_vi, vinv=True)
+                for k1 in range(n_tau):
+                    xvgvgvx[k1, k2] += gvx[k1].T @ vgvx
+                    rgvgr[k1, k2] += gr[k1] @ vgr
+
+                # tr(V^{-1} G_k1 V^{-1} c d') = tr(d' V^{-1} G_k1 V^{-1} c)
+                for _, _, vc, vd in fac2:
+                    for k1, fac1 in enumerate(factors):
+                        tr_vgvg[k1, k2] += _dotsum(vd, gmul(fac1, vc))
+
+        cov_fe = np.linalg.inv(xvx)
+        a = cov_fe @ xvgvx
+        tr_pg = tr_vg - np.trace(a, axis1=1, axis2=2)
+        tr_pgpg = (
+            tr_vgvg
+            - 2 * np.einsum("ij,klji->kl", cov_fe, xvgvgvx)
+            + np.einsum("kij,lji->kl", a, a)
+        )
+        ypgpgpy = rgvgr - xvgr @ cov_fe @ xvgr.T
+        grad = tr_pg - ypgpy
+        hess = 2 * ypgpgpy - tr_pgpg
+        return cov_fe, xvgvx, grad, (hess + hess.T) / 2, ypgpy, ypy
+
     def get_scale(self, fe_params, cov_re, vcomp):
         """
         Return the estimated error variance based on given estimates
@@ -2977,10 +3239,46 @@ class MixedLMResults(base.LikelihoodModelResults, base.ResultMixin):
 
         return ranef_dict
 
+    @cache_readonly
+    def _satterthwaite(self):
+        """
+        The pieces of the Satterthwaite degrees of freedom
+
+        Returns
+        -------
+        cov_fe : ndarray
+            ``(X' V^{-1} X)^{-1}`` at the estimated variance parameters.
+        dcov_fe : ndarray
+            The derivatives of `cov_fe` with respect to the lme4 variance
+            parameters ``(theta, sigma)``, stacked along the first axis.
+        vcov_vp : ndarray
+            The asymptotic covariance matrix of ``(theta, sigma)``, twice the
+            Moore-Penrose inverse of the Hessian of the REML deviance.
+        """
+        if self.method != "REML":
+            raise ValueError("Satterthwaite degrees of freedom require a REML fit")
+        if self.cov_pen is not None or getattr(self, "freepat", None) is not None:
+            raise ValueError(
+                "Satterthwaite degrees of freedom are not available for fits "
+                "with cov_pen or free"
+            )
+        cov_fe, xvgvx, *deriv = self.model._reml_variance_derivatives(
+            self.cov_re, self.vcomp, self.scale
+        )
+        jac, hess_vp = _theta_sigma_hessian(
+            self.cov_re, self.vcomp, self.scale, deriv, self.nobs - self.k_fe
+        )
+        # d cov_fe / d tau_k = cov_fe X' V^{-1} G_k V^{-1} X cov_fe, and
+        # cov_fe is proportional to sigma**2 for fixed theta
+        dcov_theta = np.einsum("ka,kij->aij", jac, cov_fe @ xvgvx @ cov_fe)
+        dcov_sigma = 2 / np.sqrt(self.scale) * cov_fe
+        dcov_fe = np.concatenate((dcov_theta, dcov_sigma[None]))
+        return cov_fe, dcov_fe, 2 * _pinv_lmertest(hess_vp)
+
     # Need to override since t-tests are only used for fixed effects
     # parameters.
-    def t_test(self, r_matrix, use_t=None):
-        """
+    def t_test(self, r_matrix, use_t=None, df_method=None):
+        r"""
         Compute a t-test for a each linear hypothesis of the form Rb = q
 
         Parameters
@@ -2995,6 +3293,13 @@ class MixedLMResults(base.LikelihoodModelResults, base.ResultMixin):
             distribution.
             If use_t is False, then the p-values are based on the normal
             distribution.
+        df_method : {"satterthwaite"}, optional
+            If "satterthwaite", the p-values are based on the t distribution
+            with Satterthwaite degrees of freedom for each hypothesis, and
+            the standard errors on ``(X' V^{-1} X)^{-1}``, as in the R package
+            lmerTest. This requires a REML fit, and `use_t` cannot be False.
+            If None, the default, `use_t` decides the distribution and the
+            standard errors are those of `bse_fe`. See Notes.
 
         Returns
         -------
@@ -3003,15 +3308,80 @@ class MixedLMResults(base.LikelihoodModelResults, base.ResultMixin):
             The available results have the same elements as the parameter table
             in `summary()`.
 
+        Notes
+        -----
+        With few groups, and in particular for effects that are estimated
+        between groups, the normal distribution and the residual degrees of
+        freedom ``nobs - k_fe`` both give p-values that are too small. The
+        Satterthwaite (1946) approximation matches the first two moments of
+        the estimated variance of ``l' b`` to a scaled chi-square
+        distribution, which gives
+
+        .. math::
+
+            \nu = \frac{2 (l' \Phi l)^2}{g' A g}
+
+        where :math:`\Phi = (X' V^{-1} X)^{-1}`, :math:`g` is the gradient of
+        :math:`l' \Phi l` with respect to the variance parameters and
+        :math:`A` is the asymptotic covariance matrix of the variance
+        parameters, twice the inverse of the observed Hessian of the REML
+        deviance (Giesbrecht and Burns 1985).
+
+        As in lmerTest, the variance parameters are the relative Cholesky
+        factor of the random effects covariance, the relative standard
+        deviations of the variance components and the error standard
+        deviation. This choice does not change the degrees of freedom at an
+        interior optimum, but it does if a variance is estimated as zero.
+        Eigenvalues of the Hessian below 1e-8 are dropped from its inverse,
+        with a ``ConvergenceWarning`` that names them.
+
+        If a random effect has zero variance and a random effect after it
+        has a positive variance, the Cholesky factor of the random effects
+        covariance is not unique. The factor used here has a zero column for
+        the random effect with zero variance, while lme4 keeps the factor
+        where its optimizer stopped, so the degrees of freedom can differ
+        from lmerTest. Such a fit is usually not a local optimum in these
+        parameters, and the Hessian then has a negative eigenvalue.
+
+        :math:`\Phi` ignores the uncertainty of the estimated variance
+        parameters, so its standard errors can differ from `bse_fe`, which
+        come from the inverse of the Hessian of all parameters.
+
+        References
+        ----------
+        .. [*] Satterthwaite, F. E. (1946). An approximate distribution of
+           estimates of variance components. Biometrics Bulletin 2(6),
+           110-114.
+        .. [*] Giesbrecht, F. G., and Burns, J. C. (1985). Two-stage analysis
+           based on a mixed model: large-sample asymptotic theory and
+           small-sample simulation results. Biometrics 41(2), 477-486.
+        .. [*] Kuznetsova, A., Brockhoff, P. B., and Christensen, R. H. B.
+           (2017). lmerTest package: tests in linear mixed effects models.
+           Journal of Statistical Software 82(13).
         """
         if r_matrix.shape[1] != self.k_fe:
             raise ValueError(f"r_matrix for t-test should have {self.k_fe:d} columns")
 
-        d = self.k_re2 + self.k_vc
-        z0 = np.zeros((r_matrix.shape[0], d))
-        r_matrix = np.concatenate((r_matrix, z0), axis=1)
-        tst_rslt = super().t_test(r_matrix, use_t=use_t)
-        return tst_rslt
+        if df_method is None:
+            d = self.k_re2 + self.k_vc
+            z0 = np.zeros((r_matrix.shape[0], d))
+            r_matrix = np.concatenate((r_matrix, z0), axis=1)
+            tst_rslt = super().t_test(r_matrix, use_t=use_t)
+            return tst_rslt
+
+        if df_method != "satterthwaite":
+            raise ValueError(
+                f'df_method must be None or "satterthwaite", got {df_method!r}'
+            )
+        if use_t is False:
+            raise ValueError("use_t cannot be False if df_method is given")
+        cov_fe, dcov_fe, vcov_vp = self._satterthwaite
+        effect = r_matrix @ self.fe_params
+        var = np.einsum("ij,jk,ik->i", r_matrix, cov_fe, r_matrix)
+        dvar = np.einsum("ij,ajk,ik->ia", r_matrix, dcov_fe, r_matrix)
+        df = 2 * var**2 / np.einsum("ia,ab,ib->i", dvar, vcov_vp, dvar)
+        sd = np.sqrt(var)
+        return ContrastResults(effect=effect, t=effect / sd, sd=sd, df_denom=df)
 
     def summary(self, yname=None, xname_fe=None, xname_re=None, title=None, alpha=0.05):
         """
