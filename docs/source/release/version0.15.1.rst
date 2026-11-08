@@ -401,11 +401,9 @@ Mixed models and imputation
   dropped consistently in ``get_fe_params``, ``loglike``, ``score``,
   ``hessian`` and ``get_scale``, which is the limit as these variances go to
   zero. :issue:`10239`, :pr:`10242`, :pr:`10458`
-- ``MixedLM.fit`` reported convergence where a variance was 0 although the
-  log-likelihood increases away from 0. With the default ``use_sqrt=True``
-  the gradient is zero there, and ``method="lbfgs"`` often stops there from
-  the default start in models with a single variance parameter. The optimizer
-  is now restarted from a small positive variance in this case.
+- ``MixedLM.fit`` reported convergence at a variance of 0, where the gradient
+  is zero, although the log-likelihood increases away from 0. This happened
+  often with ``method="lbfgs"``. The optimizer is now restarted off such a 0.
 - ``MixedLM`` with ``missing="drop"`` raised an ``IndexError`` because the
   rows with missing values were not dropped from all inputs, ``endog``,
   ``exog``, ``groups`` and ``exog_re``. If ``exog_vc`` is used and observations
