@@ -1331,11 +1331,11 @@ class MixedLM(base.LikelihoodModel):
         # Fit the unpenalized model to get the dependence structure.
         # Use the unwrapped results so that the estimates are arrays and
         # not pandas objects when the model has pandas data.
-        mdf = self.fit(**fit_kwargs)._results
-        fe_params = mdf.fe_params
-        cov_re = mdf.cov_re
-        vcomp = mdf.vcomp
-        scale = mdf.scale
+        unpenalized = self.fit(**fit_kwargs)._results
+        fe_params = unpenalized.fe_params
+        cov_re = unpenalized.cov_re
+        vcomp = unpenalized.vcomp
+        scale = unpenalized.scale
         try:
             cov_re_inv = np.linalg.inv(cov_re)
         except np.linalg.LinAlgError:
@@ -1384,34 +1384,34 @@ class MixedLM(base.LikelihoodModel):
         # Replace the fixed effects estimates with their penalized
         # values, leave the dependence parameters in their unpenalized
         # state.
-        params_prof = mdf.params.copy()
-        params_prof[0 : self.k_fe] = fe_params
+        params_packed = unpenalized.params.copy()
+        params_packed[0 : self.k_fe] = fe_params
+        params_object = unpenalized.params_object.copy()
+        params_object.fe_params = fe_params
 
-        scale = self.get_scale(fe_params, mdf.cov_re_unscaled, mdf.vcomp)
+        scale = self.get_scale(fe_params, params_object.cov_re, params_object.vcomp)
 
         # Get the Hessian including only the nonzero fixed effects,
         # then blow back up to the full size after inverting.
-        hess, sing = self.hessian(params_prof)
+        hess, sing = self.hessian(params_packed)
         if sing:
             warnings.warn(_warn_cov_sing, SingularMatrixWarning, stacklevel=2)
 
         pcov = np.nan * np.ones_like(hess)
-        ii = np.abs(params_prof) > ceps
+        ii = np.abs(params_packed) > ceps
         ii[self.k_fe :] = True
         ii = np.flatnonzero(ii)
         hess1 = hess[ii, :][:, ii]
         pcov[np.ix_(ii, ii)] = np.linalg.inv(-hess1)
 
-        params_object = MixedLMParams.from_components(fe_params, cov_re=cov_re)
-
-        results = MixedLMResults(self, params_prof, pcov / scale)
+        results = MixedLMResults(self, params_packed, pcov / scale)
         results.params_object = params_object
         results.fe_params = fe_params
         results.cov_re = cov_re
         results.vcomp = vcomp
         results.scale = scale
-        results.cov_re_unscaled = mdf.cov_re_unscaled
-        results.method = mdf.method
+        results.cov_re_unscaled = unpenalized.cov_re_unscaled
+        results.method = unpenalized.method
         results.converged = True
         results.cov_pen = self.cov_pen
         results.k_fe = self.k_fe

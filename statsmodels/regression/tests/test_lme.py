@@ -2064,6 +2064,34 @@ def test_fit_regularized_pandas(alpha):
     assert "x1" in summ.as_text()
 
 
+# lme4: logLik(lmer(strength ~ (1 | batch) [+ (1 | batch:cask)], REML = reml))
+@pytest.mark.parametrize(
+    "with_cask, reml, lme4_llf",
+    [
+        (False, True, -150.797705365),
+        (False, False, -151.29956537),
+        (True, True, -123.495372927),
+        (True, False, -123.997232931),
+    ],
+)
+def test_fit_regularized_unpenalized(with_cask, reml, lme4_llf):
+    data = pd.read_csv(Path(__file__).resolve().parent / "results" / "pastes.csv")
+    vc_formula = {"cask": "0 + cask"} if with_cask else None
+    model = MixedLM.from_formula(
+        "strength ~ 1", groups="batch", re_formula="1", vc_formula=vc_formula, data=data
+    )
+    fitted = model.fit(reml=reml)
+    regularized = model.fit_regularized(alpha=0.0, reml=reml)
+    assert_allclose(regularized.llf, lme4_llf, rtol=1e-7)
+    assert_allclose(regularized.llf, fitted.llf, rtol=1e-10)
+    assert_allclose(regularized.scale, fitted.scale, rtol=1e-10)
+    assert_allclose(
+        pd.DataFrame(regularized.random_effects),
+        pd.DataFrame(fitted.random_effects),
+        rtol=1e-8,
+    )
+
+
 def _missing_data(pandas):
     rng = np.random.default_rng(7978)
     n_groups, n_per_group = 20, 6
