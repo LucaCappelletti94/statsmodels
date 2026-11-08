@@ -412,6 +412,13 @@ Mixed models and imputation
 - ``MixedLM.fit_regularized`` failed for models with pandas data, for example
   from a formula: ``summary`` raised a ``KeyError`` and, with pandas 3,
   ``fit_regularized`` itself failed. :issue:`8902`, :pr:`10465`
+- ``MixedLMResults.hessv`` returned a tuple, and with the default
+  ``use_sqrt=True`` it and the standard errors of
+  ``MixedLM.fit_regularized`` were computed at the wrong random effects
+  covariance, because ``MixedLM.hessian`` read a parameter array as a
+  Cholesky factor. ``hessv`` is the Hessian matrix at ``params``, and
+  ``MixedLM.hessian`` reads an array in the packing of
+  ``MixedLMResults.params`` for every value of ``use_sqrt``.
 - ``MICE.combine`` failed for results of models that do not have a
   ``_results`` attribute, for example those of ``PHReg``. :issue:`9136`,
   :pr:`10479`, :pr:`10557`

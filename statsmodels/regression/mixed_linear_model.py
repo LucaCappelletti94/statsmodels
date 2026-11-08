@@ -2169,8 +2169,10 @@ class MixedLM(base.LikelihoodModel):
         ----------
         params : MixedLMParams or array_like
             The model parameters at which the Hessian is calculated.
-            If array-like, must contain the packed parameters in a
-            form that is compatible with this model instance.
+            If array-like, must contain the fixed effects followed by
+            the covariance parameters in the packing of
+            `MixedLMResults.params`, without the square-root
+            transformation, regardless of `use_sqrt`.
 
         Returns
         -------
@@ -2185,7 +2187,7 @@ class MixedLM(base.LikelihoodModel):
         """
         if type(params) is not MixedLMParams:
             params = MixedLMParams.from_packed(
-                params, self.k_fe, self.k_re, use_sqrt=self.use_sqrt, has_fe=True
+                params, self.k_fe, self.k_re, use_sqrt=False, has_fe=True
             )
 
         fe_params = params.fe_params
@@ -3144,6 +3146,17 @@ class MixedLMResults(base.LikelihoodModelResults, base.ResultMixin):
     @cache_readonly
     def llf(self):
         return self.model.loglike(self.params_object, profile_fe=False)
+
+    @cache_readonly
+    def hessv(self):
+        """
+        Hessian matrix of the log-likelihood at the fitted parameters.
+
+        The Hessian is taken with respect to `params`, with the variance
+        parameters divided by `scale` and not square-root transformed.
+        """
+        hess, _ = self.model.hessian(self.params)
+        return hess
 
     @cache_readonly
     def aic(self):

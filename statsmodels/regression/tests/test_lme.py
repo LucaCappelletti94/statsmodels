@@ -2131,3 +2131,49 @@ def test_missing_drop_exog_vc():
     exog = np.nan_to_num(exog)
     model = MixedLM(endog, exog, groups, exog_vc=exog_vc, missing="drop")
     assert_equal(model.nobs, 120)
+
+
+@pytest.mark.parametrize("reml", [True, False])
+@pytest.mark.parametrize("use_sqrt", [True, False])
+def test_hessv_at_fitted_params(use_sqrt, reml):
+    # hessv is the Hessian matrix at the fitted parameters, in the packing of
+    # params, whatever parameterization the optimizer used
+    rng = np.random.default_rng(9139)
+    n_groups, n_per_group = 40, 6
+    n = n_groups * n_per_group
+    groups = np.repeat(np.arange(n_groups), n_per_group)
+    exog = np.column_stack([np.ones(n), rng.standard_normal(n)])
+    re = rng.standard_normal((n_groups, 2)) @ np.array([[1.0, 0.0], [0.5, 0.7]])
+    endog = exog @ [0.5, 1.0] + np.sum(exog * re[groups], axis=1)
+    endog += rng.standard_normal(n)
+    model = MixedLM(endog, exog, groups, exog_re=exog, use_sqrt=use_sqrt)
+    res = model.fit(reml=reml)
+    assert res.converged
+
+    def loglike(x):
+        params = MixedLMParams.from_packed(
+            x, model.k_fe, model.k_re, use_sqrt=False, has_fe=True
+        )
+        return model.loglike(params, profile_fe=False)
+
+    num_hess = nd.approx_hess(res.params, loglike)
+    hess = res.hessv
+    assert isinstance(hess, np.ndarray)
+    assert_allclose(hess, num_hess, rtol=1e-4, atol=1e-4 * np.abs(hess).max())
+
+
+@pytest.mark.parametrize("use_sqrt", [True, False])
+def test_fit_regularized_unpenalized_bse(use_sqrt):
+    # Without a penalty, fit_regularized has the estimates of fit and must
+    # report the same standard errors
+    rng = np.random.default_rng(3)
+    n_groups, n_per_group = 30, 8
+    groups = np.repeat(np.arange(n_groups), n_per_group)
+    exog = rng.standard_normal((n_groups * n_per_group, 2))
+    endog = exog @ [1.0, -0.5] + rng.standard_normal(n_groups * n_per_group)
+    endog += 1.5 * rng.standard_normal(n_groups)[groups]
+    model = MixedLM(endog, exog, groups, use_sqrt=use_sqrt)
+    res = model.fit()
+    res_reg = model.fit_regularized(alpha=0.0)
+    assert_allclose(res_reg.params, res.params, rtol=1e-6)
+    assert_allclose(res_reg.bse, res.bse, rtol=1e-6)
