@@ -2131,3 +2131,111 @@ def test_missing_drop_exog_vc():
     exog = np.nan_to_num(exog)
     model = MixedLM(endog, exog, groups, exog_vc=exog_vc, missing="drop")
     assert_equal(model.nobs, 120)
+
+
+# lme4 2.1.0 with REML on the rows of the two data sets below and on Dyestuff2:
+#   lmer(y ~ x + (1 | g), d); lmer(y ~ x + (x | g), d)
+#   lmer(Yield ~ 1 + (1 | Batch), Dyestuff2)
+def _random_intercept_data():
+    rng = np.random.default_rng(188)
+    g = np.repeat(np.arange(8), 6)
+    data = pd.DataFrame({"g": g, "x": rng.normal(size=48)})
+    data["y"] = data["x"] + rng.normal(size=48) + 0.3 * rng.normal(size=8)[g]
+    return data
+
+
+def _random_slope_data():
+    rng = np.random.default_rng(11)
+    g = np.repeat(np.arange(10), 8)
+    x = rng.normal(size=80)
+    data = pd.DataFrame({"g": g, "x": x})
+    re = 0.8 * rng.normal(size=10)[g] + 0.8 * x * rng.normal(size=10)[g]
+    data["y"] = 1 + x + re + rng.normal(size=80)
+    return data
+
+
+@pytest.mark.parametrize("use_vc", [False, True])
+def test_fit_lbfgs_leaves_zero_variance(use_vc):
+    # The first L-BFGS-B step from the default start ends at the variance 0,
+    # where the score in the square root parameterization is zero.
+    data = _random_intercept_data()
+    if use_vc:
+        model = MixedLM.from_formula(
+            "y ~ x",
+            data,
+            groups=np.zeros(48),
+            re_formula="0",
+            vc_formula={"g": "0 + C(g)"},
+        )
+    else:
+        model = MixedLM.from_formula("y ~ x", data, groups=data["g"])
+    res = model.fit(method="lbfgs")
+    assert res.converged
+    assert_allclose(res.llf, -61.9424579388422, rtol=0, atol=1e-6)
+    var = res.vcomp[0] if use_vc else res.cov_re.iloc[0, 0]
+    assert_allclose(var, 0.0717892831028352, rtol=1e-4)
+    assert_allclose(res.scale, 0.6759429839758665, rtol=1e-5)
+    assert_allclose(
+        res.fe_params, [0.0575399088590791, 1.1190689048587739], rtol=1e-5
+    )
+
+
+@pytest.mark.parametrize(
+    "method, start",
+    [
+        ("lbfgs", [0.0, 1.0]),
+        ("bfgs", [0.0, 1.0]),
+        ("cg", [0.0, 1.0]),
+        ("bfgs", [0.0, 0.0]),
+        ("cg", [0.0, 0.0]),
+    ],
+)
+def test_fit_leaves_zero_cholesky_column(method, start):
+    # Every gradient method stops at a zero column of the Cholesky factor.
+    data = _random_slope_data()
+    model = MixedLM.from_formula("y ~ x", data, groups=data["g"], re_formula="~x")
+    start = MixedLMParams.from_components(np.zeros(2), cov_re=np.diag(start))
+    res = model.fit(method=method, start_params=start)
+    assert res.converged
+    assert_allclose(res.llf, -123.719289130501, rtol=0, atol=1e-5)
+    cov_re = [
+        [0.996520624650809, -0.06207487381793],
+        [-0.06207487381793, 0.677489815440572],
+    ]
+    assert_allclose(res.cov_re, cov_re, rtol=1e-3, atol=1e-4)
+    assert_allclose(res.scale, 0.782892272776144, rtol=1e-4)
+    assert_allclose(res.fe_params, [0.987058610536738, 1.067266974607337], rtol=1e-4)
+
+
+@pytest.mark.parametrize("method", ["lbfgs", "bfgs"])
+def test_fit_keeps_fixed_zero_variance(method):
+    data = _random_slope_data()
+    model = MixedLM.from_formula("y ~ x", data, groups=data["g"], re_formula="~x")
+    start = MixedLMParams.from_components(np.zeros(2), cov_re=np.diag([1.0, 0.0]))
+    free = MixedLMParams.from_components(np.ones(2), cov_re=np.diag([1.0, 0.0]))
+    res = model.fit(method=method, start_params=start, free=free)
+    assert res.converged
+    assert_equal(res.cov_re.values[1], [0.0, 0.0])
+    assert_allclose(res.llf, -130.313484513813, rtol=0, atol=1e-6)
+    assert_allclose(res.cov_re.iloc[0, 0], 0.944253961408226, rtol=1e-4)
+    assert_allclose(res.scale, 1.1798854456038, rtol=1e-5)
+
+
+@pytest.mark.parametrize("method", ["lbfgs", "bfgs", "cg"])
+def test_fit_dyestuff2_boundary(method):
+    # The REML optimum of lme4's Dyestuff2 has the batch variance 0.
+    y = [
+        7.298, 3.846, 2.434, 9.566, 7.990, 5.220, 6.556, 0.608, 11.788, -0.892,
+        0.110, 10.386, 13.434, 5.510, 8.166, 2.212, 4.852, 7.092, 9.288, 4.980,
+        0.282, 9.014, 4.458, 9.446, 7.198, 1.722, 4.782, 8.106, 0.758, 3.758,
+    ]
+    model = MixedLM(np.asarray(y), np.ones((30, 1)), np.repeat(np.arange(6), 5))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        warnings.simplefilter("ignore", SingularMatrixWarning)
+        res = model.fit(method=method)
+    assert res.converged
+    assert res.cov_re[0, 0] < 1e-8
+    assert_allclose(res.llf, -80.9141389061442, rtol=0, atol=1e-8)
+    assert_allclose(res.scale, 13.8063096275862, rtol=1e-8)
+    assert_allclose(res.fe_params, [5.6656], rtol=1e-10)

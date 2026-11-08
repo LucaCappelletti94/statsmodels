@@ -2395,6 +2395,100 @@ class MixedLM(base.LikelihoodModel):
 
         return qf
 
+    def _zero_variance_escape(self, packed, step=0.01, tol=1e-10):
+        """
+        Move off zero variances that a gradient optimizer cannot leave
+
+        Parameters
+        ----------
+        packed : ndarray
+            The packed Cholesky factor of `cov_re` and square roots of
+            `vcomp`, without the fixed effects parameters.
+        step : float, optional
+            The length of the move of each zero column of the Cholesky
+            factor and of each zero square root of a variance component.
+        tol : float, optional
+            A column or a square root whose sum of squares is below `tol` is
+            zero.
+
+        Returns
+        -------
+        ndarray or None
+            `packed` with every free zero column of the Cholesky factor and
+            every free zero square root moved by `step` in a direction along
+            which the log-likelihood increases, or None if there is no such
+            direction.
+
+        Notes
+        -----
+        The log-likelihood does not change when a column of the Cholesky
+        factor or a square root changes sign, so its gradient is zero where
+        one of them is zero, also when the variance is not at its optimum.
+        Moving a zero column by ``t * v`` adds ``t**2 * v v'`` to `cov_re`,
+        so the log-likelihood increases along ``v`` if ``v' G v > 0``,
+        where ``G`` is its derivative with respect to `cov_re`.
+        """
+        if not self.use_sqrt:
+            return None
+
+        params = MixedLMParams.from_packed(
+            packed, self.k_fe, self.k_re, use_sqrt=True, has_fe=False
+        )
+        params.fe_params, _ = self.get_fe_params(params.cov_re, params.vcomp)
+        _, score_re, score_vc = self.score_full(params, calc_fe=False)
+
+        escape = packed.copy()
+        moved = False
+        if self.k_re > 0:
+            ix = np.tril_indices(self.k_re)
+            chol = np.zeros((self.k_re, self.k_re))
+            chol[ix] = packed[: self.k_re2]
+            # score_re[j] moves both off-diagonal entries of cov_re.
+            dcov = np.zeros((self.k_re, self.k_re))
+            dcov[ix] = score_re
+            dcov = (dcov + dcov.T) / 2
+            if self._freepat is None:
+                free = np.ones((self.k_re, self.k_re), dtype=bool)
+            else:
+                free = self._freepat.cov_re != 0
+            for i in range(self.k_re):
+                jj = i + np.flatnonzero(free[i:, i])
+                if len(jj) == 0 or np.sum(chol[i:, i] ** 2) >= tol:
+                    continue
+                eval_, evec = np.linalg.eigh(dcov[np.ix_(jj, jj)])
+                if eval_[-1] > 0:
+                    v = evec[:, -1]
+                    chol[jj, i] = step * (v if v[0] >= 0 else -v)
+                    moved = True
+            escape[: self.k_re2] = chol[ix]
+
+        for j in range(self.k_vc):
+            free = self._freepat is None or self._freepat.vcomp[j] != 0
+            if free and packed[self.k_re2 + j] ** 2 < tol and score_vc[j] > 0:
+                escape[self.k_re2 + j] = step
+                moved = True
+
+        return escape if moved else None
+
+    def _fit_optimizer(self, packed, method, fit_kwargs):
+        """
+        Optimize from `packed`, restarting once off a spurious zero variance
+        """
+        for _ in range(2):
+            rslt = super().fit(
+                start_params=packed,
+                skip_hessian=True,
+                method=method,
+                **fit_kwargs,
+            )
+            if not rslt.mle_retvals["converged"]:
+                return rslt
+            packed = self._zero_variance_escape(rslt.params)
+            if packed is None:
+                return rslt
+        rslt.mle_retvals["converged"] = False
+        return rslt
+
     def fit(
         self,
         start_params=None,
@@ -2531,12 +2625,7 @@ class MixedLM(base.LikelihoodModel):
 
             # Try optimizing one or more times
             for j in range(len(method)):
-                rslt = super().fit(
-                    start_params=packed,
-                    skip_hessian=True,
-                    method=method[j],
-                    **fit_kwargs,
-                )
+                rslt = self._fit_optimizer(packed, method[j], fit_kwargs)
                 if rslt.mle_retvals["converged"]:
                     break
                 packed = rslt.params
